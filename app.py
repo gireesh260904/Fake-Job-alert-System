@@ -492,11 +492,11 @@ def explain():
 
         job_sims = []
         for ref in predictor.job_ref_embeddings:
-            sim = float(np.dot(embedding, ref) / (np.linalg.norm(embedding) * np.linalg.norm(ref))) if np.linalg.norm(embedding) and np.linalg.norm(ref) else 0.0
+            sim = predictor.cosine_sim(embedding, ref)
             job_sims.append(sim)
         non_job_sims = []
         for ref in predictor.non_job_ref_embeddings:
-            sim = float(np.dot(embedding, ref) / (np.linalg.norm(embedding) * np.linalg.norm(ref))) if np.linalg.norm(embedding) and np.linalg.norm(ref) else 0.0
+            sim = predictor.cosine_sim(embedding, ref)
             non_job_sims.append(sim)
 
         max_job = max(job_sims) if job_sims else 0.0

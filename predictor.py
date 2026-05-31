@@ -17,6 +17,7 @@ warnings.filterwarnings('ignore')
 
 
 class FakeJobPredictor:
+    jd_detector = None  # (vectorizer, model) dict loaded lazily
     def clean_text(self, text):
         """Clean and preprocess text: lowercase, remove URLs, emails, special chars, normalize whitespace"""
         if text is None:
@@ -27,6 +28,16 @@ class FakeJobPredictor:
         text = re.sub(r'[^a-zA-Z\s.,!?]', ' ', text)
         text = re.sub(r'\s+', ' ', text).strip()
         return text
+    def cosine_sim(self, a, b, eps=1e-8):
+        """Safe cosine similarity that avoids division by zero."""
+        try:
+            na = np.linalg.norm(a)
+            nb = np.linalg.norm(b)
+            if na < eps or nb < eps:
+                return 0.0
+            return float(np.dot(a, b) / (na * nb))
+        except Exception:
+            return 0.0
     def get_bert_embedding(self, text, max_length=512):
         """Generate BERT embedding for text using DistilBERT [CLS] token"""
         if len(text) == 0:
@@ -67,6 +78,14 @@ class FakeJobPredictor:
         )
         self.bert_model = DistilBertModel.from_pretrained('distilbert-base-uncased').to(self.device)
         self.bert_model.eval()
+
+        # Try to load JD detector if available
+        self.jd_detector_path = os.path.join(model_dir, 'jd_detector.joblib')
+        if os.path.exists(self.jd_detector_path):
+            try:
+                self.jd_detector = joblib.load(self.jd_detector_path)
+            except Exception:
+                self.jd_detector = None
 
         # Precompute and cache reference embeddings for semantic checks to speed up validation
         self.job_reference_texts = [
@@ -327,13 +346,45 @@ class FakeJobPredictor:
         if max_freq > len(words[:100]) * 0.3:
             return False, {"valid": False, "reason": "repetitive_corrupted", "message": "Text appears to be repetitive or corrupted.", "content_type": "noise"}
         
+        # === MODEL-BASED JD DETECTOR (if available) ===
+        cleaned_text = self.clean_text(text)
+        if len(cleaned_text) < 10:
+            return False, {"valid": False, "reason": "too_short_after_clean", "message": "Insufficient content after cleaning.", "content_type": None}
+
+        if self.jd_detector:
+            try:
+                vec = self.jd_detector['vectorizer'].transform([cleaned_text])
+                probs = None
+                if hasattr(self.jd_detector['model'], 'predict_proba'):
+                    probs = self.jd_detector['model'].predict_proba(vec)[0]
+                # Class order for LogisticRegression is sorted by classes_
+                # We'll map probability of class 1 (jd) if available
+                p_jd = None
+                if probs is not None:
+                    # Find index of class 1
+                    classes = list(getattr(self.jd_detector['model'], 'classes_', [0, 1]))
+                    if 1 in classes:
+                        p_jd = float(probs[classes.index(1)])
+                else:
+                    # Fall back to decision_function
+                    df = self.jd_detector['model'].decision_function(vec)
+                    # Convert to pseudo-prob by sigmoid
+                    import numpy as _np
+                    p_jd = float(1 / (1 + _np.exp(-df))) if hasattr(df, '__array__') else 0.5
+
+                # Early reject if model is confident it's not a JD
+                if p_jd is not None and p_jd < 0.2:
+                    return False, {"valid": False, "reason": "jd_model_negative", "message": f"JD detector model indicates non-job (p_jd={p_jd:.2f}).", "content_type": "non_job",
+                                   "debug_model": {"p_jd": p_jd}}
+            except Exception:
+                # If detector fails, continue with semantic checks
+                pass
+
         # === SEMANTIC UNDERSTANDING WITH BERT ===
         # Instead of keyword matching, use BERT to understand the context
         
         # Generate embedding for the input text
-        cleaned_text = self.clean_text(text)
-        if len(cleaned_text) < 10:
-            return False, "Text doesn't contain meaningful content after cleaning."
+        # cleaned_text already computed above
         
         # Check for explicit college/university/portal indicators first (per summary)
         edu_portal_indicators = [
@@ -355,17 +406,13 @@ class FakeJobPredictor:
         # Calculate cosine similarity with job references (use cached embeddings)
         job_similarities = []
         for ref_embedding in self.job_ref_embeddings:
-            similarity = np.dot(input_embedding, ref_embedding) / (
-                np.linalg.norm(input_embedding) * np.linalg.norm(ref_embedding)
-            )
+            similarity = self.cosine_sim(input_embedding, ref_embedding)
             job_similarities.append(similarity)
         
         # Calculate cosine similarity with non-job references (use cached embeddings)
         non_job_similarities = []
         for ref_embedding in self.non_job_ref_embeddings:
-            similarity = np.dot(input_embedding, ref_embedding) / (
-                np.linalg.norm(input_embedding) * np.linalg.norm(ref_embedding)
-            )
+            similarity = self.cosine_sim(input_embedding, ref_embedding)
             non_job_similarities.append(similarity)
         
         # Get max similarities
@@ -404,9 +451,7 @@ class FakeJobPredictor:
         # Find which reference embedding had the highest similarity
         similarities = []
         for ref_embedding in reference_embeddings:
-            sim = np.dot(input_embedding, ref_embedding) / (
-                np.linalg.norm(input_embedding) * np.linalg.norm(ref_embedding)
-            )
+            sim = self.cosine_sim(input_embedding, ref_embedding)
             similarities.append(sim)
         
         max_idx = similarities.index(max(similarities))
@@ -474,15 +519,14 @@ class FakeJobPredictor:
             for m in re.finditer(pattern, text, flags=re.IGNORECASE):
                 candidates.append(m.group(1))
 
+        from utils.date_utils import parse_candidate_date
+
         parsed_dates = []
         now = datetime.now()
         for ds in candidates:
-            try:
-                dt = dateparser.parse(ds, settings={'DATE_ORDER': 'DMY', 'PREFER_DAY_OF_MONTH': 'first'})
-                if dt:
-                    parsed_dates.append(dt)
-            except Exception:
-                continue
+            dt = parse_candidate_date(ds, now=now)
+            if dt:
+                parsed_dates.append(dt)
 
         if parsed_dates:
             # choose the first or earliest reasonable future/past deadline
